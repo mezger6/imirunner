@@ -1,0 +1,14 @@
+aws:
+  region: us-east-1
+  ami_id: ami-0d1f9163a7a4c609f
+  instance_type: c5.9xlarge
+  launch_template_id: lt-20d224e2c4a10330d
+
+paths:
+  local_data: /data/local
+  s3_data: /data/s3
+  ssh_key: /root/imikey.pem
+
+region:
+  shapefile: CountryShapefile
+  state_vector: CountryStateVector.nc

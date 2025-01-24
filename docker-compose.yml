@@ -1,0 +1,17 @@
+services:
+  imirunner:
+    container_name: imirunner
+    privileged: true
+    build: .
+    ports:
+      - 15522:22/tcp
+    environment:
+      - TZ=${TIMEZONE:-Europe/Athens}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ${LOCAL_DATA_PATH:-/path/to/local/data}:/data/local
+      - ${SSH_KEY_PATH:-/path/to/EC2/sshkey.pem}:/root/imikey.pem
+      - ${SSH_AUTHORIZED_KEYS_PATH:-/path/to/authorized_keys}:/root/.ssh/authorized_keys
+    network_mode: bridge
