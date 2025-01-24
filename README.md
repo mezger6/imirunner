@@ -64,7 +64,7 @@ A tool to automate running the [Integrated Methane Inversion](https://github.com
      network_mode: bridge
    ```
 
-4. Start the container with `docker-compose up -d`.
+4. Start the container with `docker compose up -d`.
 
 ## Initial configuration
 
@@ -136,7 +136,7 @@ A tool to automate running the [Integrated Methane Inversion](https://github.com
 
 - Create an EC2 instance:
   ```bash
-  ./imirunner.py create --options="--instance-type c5.9xlarge"
+  ./imirunner.py create --options='{"InstanceType": "c5.9xlarge"}'
   ```
 - View instances and their status:
   ```bash
