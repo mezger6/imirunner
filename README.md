@@ -154,3 +154,8 @@ A tool to automate running the [Integrated Methane Inversion](https://github.com
   ```bash
   ./imirunner.py copy_local my_run
   ```
+
+
+## Funding
+
+The development of this tool was funded by [2Celcius](https://2celsius.org/)
