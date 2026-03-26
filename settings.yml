@@ -12,3 +12,4 @@ paths:
 region:
   shapefile: CountryShapefile
   state_vector: CountryStateVector.nc
+  alt_state_vector: CountryStateVector.12.nc

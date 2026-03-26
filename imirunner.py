@@ -34,6 +34,7 @@ S3_DATA_PATH = config['paths']['s3_data']
 # Region-specific configuration
 SHAPEFILE = config['region']['shapefile']
 STATE_VECTOR = config['region']['state_vector']
+ALT_STATE_VECTOR = config['region']['alt_state_vector']
 
 # Initialize boto3 client
 ec2 = boto3.client('ec2', region_name=AWS_REGION)
@@ -50,17 +51,32 @@ def create_instance(options=None):
             'KeyName': 'imikey'
         }
         if options:
-            try:
-                options_dict = json.loads(options)
-                run_args.update(options_dict)
-            except json.JSONDecodeError as e:
-                logging.error(f"❌ Invalid JSON format: {str(e)}")
-                logging.error("💡 Example valid format: {\"InstanceType\": \"t3.micro\", \"KeyName\": \"my-key\"}")
-                return False
-            except Exception as e:
-                logging.error(f"❌ Invalid options: {str(e)}")
-                return False
-        
+            if options.startswith('file:'):
+                options_path = options[5:]
+                if os.path.exists(options_path):
+                    with open(options_path, 'r') as f:
+                        try:
+                            options_dict = json.load(f)
+                            run_args.update(options_dict)
+                        except json.JSONDecodeError as e:
+                            logging.error(f"❌ Invalid JSON format in file: {str(e)}")
+                            logging.error("💡 Ensure the file contains valid JSON")
+                            return False
+                else:
+                    logging.error(f"❌ Options file not found: {options_path}")
+                    return False
+            else:
+                try:
+                    options_dict = json.loads(options)
+                    run_args.update(options_dict)
+                except json.JSONDecodeError as e:
+                    logging.error(f"❌ Invalid JSON format: {str(e)}")
+                    logging.error("💡 Example valid format: {\"InstanceType\": \"t3.micro\", \"KeyName\": \"my-key\"}")
+                    return False
+                except Exception as e:
+                    logging.error(f"❌ Invalid options: {str(e)}")
+                    return False
+            
         # Start instance
         response = ec2.run_instances(**run_args)
         instance_id = response['Instances'][0]['InstanceId']
@@ -120,9 +136,11 @@ def instance_setup(public_url):
         files_to_copy = [
             ("tmux_install.sh", "/home/ubuntu/"),
             ("fixslurm.sh", "/home/ubuntu/"),
+            ("preview_to_netcdf.py", "/home/ubuntu/integrated_methane_inversion/"),
             (f"{SHAPEFILE}.shp", "/home/ubuntu/integrated_methane_inversion"),
             (f"{SHAPEFILE}.shx", "/home/ubuntu/integrated_methane_inversion"),
-            (STATE_VECTOR, "/home/ubuntu/integrated_methane_inversion")
+            (STATE_VECTOR, "/home/ubuntu/integrated_methane_inversion"),
+            (ALT_STATE_VECTOR, "/home/ubuntu/integrated_methane_inversion")
         ]
         
         for local_file, remote_path in files_to_copy:
@@ -138,7 +156,26 @@ def instance_setup(public_url):
         commands = [
             "sudo apt remove -y tmux",
             "chmod +x tmux_install.sh && ./tmux_install.sh",
-            "chmod +x fixslurm.sh && ./fixslurm.sh"
+            "chmod +x fixslurm.sh && ./fixslurm.sh",
+            # Fix plumes.py _grid_all_data(): it appends every ds_i to d_list
+            # (including None when a dataset has no ROI plumes) but only appends
+            # to d_names when non-None. xr.concat then crashes on None entries,
+            # and d_list/d_names lengths mismatch. Fix: gate both appends on
+            # ds_i is not None, and simplify the check to len(d_list) > 0.
+            "python3 -c \""
+            "p='/home/ubuntu/integrated_methane_inversion/src/inversion_scripts/plumes.py';"
+            "t=open(p).read();"
+            "t=t.replace("
+            "'            d_list.append(ds_i)\\n"
+            "            if ds_i is not None:\\n"
+            "                d_names.append(d.myname)',"
+            "'            if ds_i is not None:\\n"
+            "                d_list.append(ds_i)\\n"
+            "                d_names.append(d.myname)');"
+            "t=t.replace("
+            "'if not all([i is None for i in d_list])',"
+            "'if len(d_list) > 0');"
+            "open(p,'w').write(t)\"",
         ]
         
         subprocess.run([
@@ -204,26 +241,81 @@ def restart_instance(instance_no=0):
 
 def cancel_spot(instance_no=0):
     try:
+        # Resolve the instance ID for the given instance_no
+        if not get_instance(instance_no):
+            logging.error("No instance found")
+            return
+        instance_id = os.getenv(INSTANCE_ID_VAR)
+
+        # Find the spot request associated with this instance
         spot_requests = ec2.describe_spot_instance_requests(
-            Filters=[{'Name': 'state', 'Values': ['active']}]
+            Filters=[{'Name': 'state', 'Values': ['active', 'open']}]
         )['SpotInstanceRequests']
-        
-        if not spot_requests:
-            logging.info("No active spot requests")
+
+        request_id = None
+        for req in spot_requests:
+            if req.get('InstanceId') == instance_id:
+                request_id = req['SpotInstanceRequestId']
+                break
+
+        if not request_id:
+            logging.error(f"No active spot request found for instance {instance_id}")
             return
-            
-        if instance_no >= len(spot_requests):
-            logging.error(f"No spot request #{instance_no}")
-            return
-            
-        request_id = spot_requests[instance_no]['SpotInstanceRequestId']
+
         ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[request_id])
-        logging.info(f"Cancelled spot request: {request_id}")
-        
+        logging.info(f"Cancelled spot request: {request_id} (instance {instance_id})")
+
     except Exception as e:
         logging.error(f"Spot cancellation failed: {e}")
 
-def run_command(configfile="config.yml", instance_no=0, options=None, tmux=False):
+def run_preview_nc(configfile, instance_no=0, conda_env=None):
+    """Run preview_to_netcdf.py on the remote instance to save preview outputs as NetCDF."""
+    if not get_instance(instance_no):
+        logging.error("No valid instance available")
+        return False
+
+    public_url = os.getenv(PUBLIC_URL_VAR)
+    if not public_url:
+        logging.error("No public URL found for instance")
+        return False
+
+    # Read CondaEnv from config if not provided
+    if not conda_env:
+        try:
+            with open(configfile, 'r') as f:
+                run_config = yaml.safe_load(f)
+            conda_env = run_config.get("CondaEnv", "imi_env")
+        except Exception:
+            conda_env = "imi_env"
+
+    imi_path = "/home/ubuntu/integrated_methane_inversion"
+    config_remote = f"{imi_path}/{os.path.basename(configfile)}"
+
+    # Use bash -lc so that .bashrc conda init block runs,
+    # then activate the IMI conda environment before running the script
+    inner_cmd = (
+        f"conda activate {conda_env} && "
+        f"cd {imi_path} && "
+        f"python3 preview_to_netcdf.py "
+        f"--config {config_remote} "
+        f"--imi-path {imi_path}"
+    )
+
+    logging.info(f"Running preview_to_netcdf.py on remote instance (conda env: {conda_env})...")
+    result = subprocess.run(
+        ["ssh", "-i", SSH_KEY_PATH, f"ubuntu@{public_url}",
+         f"bash -lc '{inner_cmd}'"],
+        capture_output=False
+    )
+
+    if result.returncode == 0:
+        logging.info("preview_to_netcdf.py completed successfully")
+        return True
+    else:
+        logging.error("preview_to_netcdf.py failed")
+        return False
+
+def run_command(configfile="config.yml", instance_no=0, options=None, tmux=False, preview_nc=False):
     try:
         # Validate instance connection
         if not get_instance(instance_no):
@@ -303,13 +395,16 @@ def run_command(configfile="config.yml", instance_no=0, options=None, tmux=False
         ])
 
         logging.info(f"Inversion started successfully for config: {configfile}")
-        tail_logfile(logfile="imi_output.log", instance_no=instance_no, run_name=run_name or config_stem)
+        tail_logfile(logfile="imi_output.log", instance_no=instance_no,
+                     run_name=run_name or config_stem,
+                     preview_nc=preview_nc, configfile=configfile)
 
     except Exception as e:
         logging.error(f"Failed to execute run command: {e}")
         sys.exit(1)
 
-def tail_logfile(logfile="imi_output.log", instance_no=0, run_name=None):
+def tail_logfile(logfile="imi_output.log", instance_no=0, run_name=None,
+                 preview_nc=False, configfile=None):
     if not get_instance(instance_no):
         return
         
@@ -326,7 +421,11 @@ def tail_logfile(logfile="imi_output.log", instance_no=0, run_name=None):
             for line in iter(process.stdout.readline, b''):
                 print(line.decode().strip())
                 if "Posterior" in line.decode() or "IMI ended" in line.decode():
-                    logging.info("Run completed, copying results...")
+                    logging.info("Run completed")
+                    if preview_nc and configfile:
+                        logging.info("Generating preview NetCDF files...")
+                        run_preview_nc(configfile, instance_no)
+                    logging.info("Copying results...")
                     copy_to_local(run_name, instance_no)
                     break
         else:
@@ -335,11 +434,13 @@ def tail_logfile(logfile="imi_output.log", instance_no=0, run_name=None):
     except Exception as e:
         logging.error(f"Log tail failed: {e}")
 
-def open_shell(instance_no=0, *args):
+def open_shell(instance_no=0, args=None):
+    logging.info("getting instance")
     if not get_instance(instance_no):
         return
-        
+    
     public_url = os.getenv(PUBLIC_URL_VAR)
+
     cmd = ["ssh", "-i", SSH_KEY_PATH, f"ubuntu@{public_url}"]
     
     if args:
@@ -403,13 +504,14 @@ def copy_to_local(run_name, instance_no=0, overwrite=False):
         os.makedirs(local_dir, exist_ok=True)
 
         # Define all remote directories and files to copy
-        transfer_items = [
+        transfer_dirs = [
             # Directories (rsync)
             (f"{remote_base}/preview", "preview"),
             (f"{remote_base}/inversion", "inversion"),
             (f"{remote_base}/hemco_prior_emis", "hemco_prior_emis"),
             (f"{remote_base}/archive_sf", "archive_sf"),
-            
+        ]
+        transfer_files = [
             # Individual files (scp)
             (f"{remote_base}/imi_output.log", ""),
             (f"{remote_base}/StateVector.nc", ""),
@@ -417,8 +519,24 @@ def copy_to_local(run_name, instance_no=0, overwrite=False):
             (f"{remote_base}/config_{run_name}.yml", "config.yml")
         ]
 
-        # Copy each item
-        for remote_path, local_subdir in transfer_items:
+        # Copy each dir
+        for remote_path, local_subdir in transfer_dirs:
+            try:
+                local_target = os.path.join(local_dir, local_subdir) if local_subdir else local_dir
+            
+                subprocess.run([
+                    "rsync", "-azP",
+                    "-e", f"ssh -i {SSH_KEY_PATH}",
+                    f"ubuntu@{public_url}:{remote_path}/",
+                    f"{local_target}/"
+                ])
+   
+            except Exception as e:
+                logging.warning(f"Failed to copy {remote_path}: {str(e)}")
+                continue
+                
+        # Copy each file
+        for remote_path, local_subdir in transfer_files:
             try:
                 local_target = os.path.join(local_dir, local_subdir) if local_subdir else local_dir
                 
@@ -442,24 +560,18 @@ def copy_to_local(run_name, instance_no=0, overwrite=False):
                         os.path.join(local_dir, "config.yml")
                     ])
                     
-                else:  # Directory or single file
-                    if 'preview' in remote_path or 'inversion' in remote_path:  # Directory
-                        subprocess.run([
-                            "rsync", "-azP",
-                            "-e", f"ssh -i {SSH_KEY_PATH}",
-                            f"ubuntu@{public_url}:{remote_path}/",
-                            f"{local_target}/"
-                        ])
-                    else:  # Single file
-                        subprocess.run([
-                            "scp", "-i", SSH_KEY_PATH,
-                            f"ubuntu@{public_url}:{remote_path}",
-                            local_target
-                        ])
+                else:  
+                    # Single file
+                    subprocess.run([
+                        "scp", "-i", SSH_KEY_PATH,
+                        f"ubuntu@{public_url}:{remote_path}",
+                        local_target
+                    ])
                         
             except Exception as e:
                 logging.warning(f"Failed to copy {remote_path}: {str(e)}")
                 continue
+
 
         logging.info(f"Successfully copied all data to: {local_dir}")
         return local_dir
@@ -534,8 +646,12 @@ def print_help():
         restart [-i NUM]         Restart a stopped EC2 instance
         cancel_spot [-i NUM]     Cancel an active spot request
         instance_setup [-i NUM]  Run setup scripts on existing instance
-        run <configfile> [-i NUM] [--tmux] [--options]
+        run <configfile> [-i NUM] [--tmux] [--preview-nc] [--options]
                                 Run inversion using specified config file
+                                --preview-nc: generate preview NetCDF files after run completes
+        preview_nc <configfile> [-i NUM]
+                                Run preview_to_netcdf.py on remote instance
+                                (requires completed IMI preview run)
         log [-i NUM] [--logfile] Tail log file (default: imi_output.log)
         shell [-i NUM] [command] Open SSH session or execute command
         copy_local [-i NUM] <run_name> [--overwrite]
@@ -595,9 +711,18 @@ def main():
     run_parser.add_argument('configfile', help='Configuration file path')
     run_parser.add_argument('-i', '--instance', type=int, default=0,
                           help='Instance number (0-based index)')
-    run_parser.add_argument('--tmux', action='store_true', 
+    run_parser.add_argument('--tmux', action='store_true',
                           help='Run in tmux session')
+    run_parser.add_argument('--preview-nc', action='store_true',
+                          help='Run preview_to_netcdf.py after IMI completes')
     run_parser.add_argument('--options', help='Additional run options')
+
+    # Preview NetCDF command
+    preview_nc_parser = subparsers.add_parser('preview_nc',
+                                             help='Run preview_to_netcdf.py on remote instance')
+    preview_nc_parser.add_argument('configfile', help='Configuration file path')
+    preview_nc_parser.add_argument('-i', '--instance', type=int, default=0,
+                                  help='Instance number (0-based index)')
 
     # Log command
     log_parser = subparsers.add_parser('log', help='Tail log files')
@@ -630,7 +755,7 @@ def main():
                                        help='Open SSH session to instance')
     shell_parser.add_argument('-i', '--instance', type=int, default=0,
                             help='Instance number (0-based index)')
-    shell_parser.add_argument('command', nargs=argparse.REMAINDER,
+    shell_parser.add_argument('shell_command', nargs=argparse.REMAINDER,
                             help='Command to execute remotely')
 
     # Help command
@@ -651,12 +776,13 @@ def main():
         'restart': lambda: restart_instance(args.instance),
         'cancel_spot': lambda: cancel_spot(args.instance),
         'instance_setup': lambda: instance_setup_cli(args.instance),
-        'run': lambda: run_command(args.configfile, args.instance, args.options, args.tmux),
+        'run': lambda: run_command(args.configfile, args.instance, args.options, args.tmux, args.preview_nc),
+        'preview_nc': lambda: run_preview_nc(args.configfile, args.instance),
         'log': lambda: tail_logfile(logfile=args.logfile, instance_no=args.instance),
         'copy_local': lambda: copy_to_local(args.run_name, args.instance, args.overwrite),
         'copy_from_s3': lambda: copy_from_s3(args.run_name, args.instance),
         'get_instance': lambda: get_instance(args.instance),
-        'shell': lambda: open_shell(args.instance, *args.command),
+        'shell': lambda: open_shell(args.instance, args.shell_command),
         'help': lambda: print_help()
     }
 

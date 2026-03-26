@@ -1,0 +1,12 @@
+{
+    "InstanceType": "c5.9xlarge",
+    "BlockDeviceMappings": [
+        {
+            "DeviceName": "/dev/sda1",
+            "Ebs": {
+                "VolumeSize": 200,
+                "VolumeType": "gp3"
+            }
+        }
+    ]
+}
